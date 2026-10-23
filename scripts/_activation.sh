@@ -38,7 +38,9 @@ hermes_bootstrap_python() {
                      "$repo/venv/bin/python" "$repo/venv/Scripts/python.exe"; do
         [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
     done
-    for store in "${HERMES_RUNTIME_DIR:-}" "$repo/../tools" "${HERMES_HOME:-$HOME/.hermes}/tools"; do
+    # The Windows data root is %LOCALAPPDATA%\hermes, not $HOME/.hermes; that layout is absent on
+    # POSIX, so this extra store is inert there. An explicit HERMES_HOME still wins (listed first).
+    for store in "${HERMES_RUNTIME_DIR:-}" "$repo/../tools" \n                 "${HERMES_HOME:-$HOME/.hermes}/tools" "$HOME/AppData/Local/hermes/tools"; do
         [ -n "$store" ] || continue
         for candidate in "$store"/python-*/bin/python3 "$store"/python-*/python.exe \
                          "$store"/python-*/bin/python "$store"/python-*/bin/python.exe; do

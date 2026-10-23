@@ -1,0 +1,36 @@
+name: bale-platform
+label: Bale
+kind: platform
+version: 1.0.0
+description: >
+  Bale gateway adapter for Hermes Agent. Connects to the Iranian messaging app
+  Bale (bale.ai) through its Telegram-style Bot API and relays messages between
+  Bale chats/groups/channels and the Hermes agent. Long-polls getUpdates, sends
+  text and photos with native markdown, typing indicators, user allowlists,
+  and cron delivery. No extra packages needed — plain HTTPS.
+author: Nous Research
+# ``requires_env`` entries are surfaced in ``hermes config`` UI via the
+# platform-plugin env var injector in ``hermes_cli/config.py``.
+requires_env:
+  - name: BALE_BOT_TOKEN
+    description: "Bale bot token from @botfather in the Bale app"
+    prompt: "Bale bot token"
+    url: "https://bale.ai"
+    password: true
+optional_env:
+  - name: BALE_ALLOWED_USERS
+    description: "Comma-separated Bale user IDs allowed to talk to the bot"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: BALE_ALLOW_ALL_USERS
+    description: "Allow any Bale user to trigger the bot (dev only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: BALE_HOME_CHANNEL
+    description: "Default chat ID for cron / notification delivery"
+    prompt: "Home channel ID"
+    password: false
+  - name: BALE_POLL_TIMEOUT_S
+    description: "Server-side long-poll wait in seconds (default 50, max 70)"
+    prompt: "Poll timeout (seconds)"
+    password: false
