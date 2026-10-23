@@ -175,8 +175,10 @@ class BaleAdapter(BasePlatformAdapter):
             return False
         try:
             self._http = httpx.AsyncClient(timeout=self._poll_timeout_s + 30, verify=platform_ssl_context())
+            # getMe puts the user object directly in the body's ``result`` (Telegram shape);
+            # _api_call already returns that field, so no second unwrap.
             me = await self._api_call("getMe")
-            user = me.get("result") or {}
+            user = me if isinstance(me, dict) else {}
             self._bot_id = int(user.get("id", -1))
         except BaleAPIError as e:
             if e.status in (401, 403):
