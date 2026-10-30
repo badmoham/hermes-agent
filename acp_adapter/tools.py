@@ -19,11 +19,12 @@ TOOL_KIND_MAP: dict[str, ToolKind] = {
     name: kind
     for kind, names in {
         "read": ("read_file", "skill_view", "skills_list", "browser_snapshot", "browser_vision",
-                 "browser_get_images", "vision_analyze"),
+                 "browser_get_images", "vision_analyze", "browser_listen"),
         "edit": ("write_file", "patch", "skill_manage"),
         "search": ("search_files",),
         "execute": ("terminal", "process", "execute_code", "browser_click", "browser_type", "browser_scroll",
-                    "browser_press", "browser_back", "delegate_task", "image_generate", "text_to_speech"),
+                    "browser_press", "browser_back", "delegate_task", "image_generate", "text_to_speech",
+                    "browser_speak", "browser_stop_speaking"),
         "fetch": ("web_search", "web_extract", "browser_navigate"),
         "other": ("todo",),
         "think": ("_thinking",),
@@ -514,6 +515,32 @@ def _format_browser_result(tool_name: str, data: Args, args: Args) -> Optional[s
 
 
 @_structured(text_fallback=True)
+def _format_browser_voice_result(tool_name: str, data: Args, args: Args) -> Optional[str]:
+    if failed := _failure(data, f"{tool_name} failed"):
+        return failed
+    text = str(_first(data, "text", "spoken_text", default="")).strip()
+    lang = str(_first(args or {}, data, "lang", "language", default="")).strip() if tool_name == "browser_speak" else None
+    lines = []
+    if tool_name == "browser_speak":
+        display_text = text or _arg(data if isinstance(data, dict) else {}, "text", args)
+        lines.append(f"🔊 Spoke: {display_text[:200]}")
+    elif tool_name == "browser_listen":
+        if data.get("status") == "timeout":
+            return "⏱ No speech detected (timeout)"
+        display_text = text or _arg(args, "text", default="")
+        lines.append(f"🎤 Heard: {display_text[:200]}")
+    elif tool_name == "browser_stop_speaking":
+        return "🔇 Speech stopped"
+    if lang:
+        lines.append(f"Language: {lang}")
+    if not text and tool_name in ("browser_speak", "browser_listen"):
+        raw = str(_first(data, "raw_result", default="")).strip()
+        if raw:
+            lines.extend(["", _truncate_text(raw, limit=500)])
+    return _truncate_text("\n".join(lines), limit=7000) if lines else None
+
+
+@_structured(text_fallback=True)
 def _format_media_or_cron_result(tool_name: str, data: Args, args: Args) -> Optional[str]:
     if failed := _failure(data, f"{tool_name} failed"):
         return failed
@@ -632,6 +659,7 @@ _COMPLETION_FORMATTERS: dict[str, _Formatter] = {
     "skill_manage": _format_skill_manage_result,
     "web_search": _format_web_search_result,
     **{n: _format_browser_result for n in ("browser_navigate", "browser_snapshot", "browser_vision", "browser_get_images")},
+    **{n: _format_browser_voice_result for n in ("browser_speak", "browser_listen", "browser_stop_speaking")},
     **{n: _format_media_or_cron_result for n in ("vision_analyze", "image_generate", "cronjob")},
 }
 

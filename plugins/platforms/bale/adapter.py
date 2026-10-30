@@ -7,6 +7,15 @@ outbound text is auto-formatted by Bale as markdown — bold needs `` *text* `` 
 ``_text_`` (each requiring surrounding spaces) — so the adapter converts Hermes
 markdown to that flavour before sending.
 
+Inbound media: photo/video/document/audio updates carry a ``file_id``; the adapter
+calls ``getFile`` for the download path, fetches it from
+``https://tapi.bale.ai/file/bot<token>/<path>`` (bots may download ≤20 MB), and
+caches it through Hermes' shared media pipeline before the turn runs.
+Stickers/animation are not supported yet. Outbound voice notes ride the Telegram-style
+``sendVoice`` endpoint: native voice bubbles require Ogg/Opus, so non-Opus audio is
+transcoded with ffmpeg when available (the same contract Telegram and Matrix enforce).
+Without ffmpeg the original container is uploaded with its honest content type.
+
 config.yaml ``gateway.platforms.bale.extra`` keys: bot_token, allowed_users,
 allow_all_users, poll_timeout_s. Env vars override config.yaml: BALE_BOT_TOKEN,
 BALE_ALLOWED_USERS, BALE_ALLOW_ALL_USERS, BALE_POLL_TIMEOUT_S, BALE_HOME_CHANNEL.
@@ -23,15 +32,20 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+from urllib.parse import quote
+
 from agent.ssl_verify import platform_ssl_context
 from gateway.platforms._shared import (
     get_scoped_secret as _get_scoped_secret,
     seed_extra_from_env as _seed_extra_from_env,
     send_error,
 )
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter, CachedMedia, SendResult, cache_media_bytes_async,
+    transcode_to_ogg_opus)
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.config import Platform
+from tools.url_safety import is_safe_url
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +55,60 @@ _POLL_LIMIT = 100           # getUpdates: max updates per call (1-100, default 1
 _POLL_TIMEOUT_S = 50        # server-side long-poll wait (seconds; Telegram-style, max ~70)
 
 _TRUTHY = {"1", "true", "yes"}
+
+# Inbound Bale media field → (MessageEvent type, default classification kind).
+# User-recorded voice notes arrive in the "voice" field (not "audio"); audio is for
+# music files uploaded from disk. Both use OGG/Opus containers.
+_MEDIA_FIELDS: dict[str, tuple[MessageType, Optional[str]]] = {
+    "photo": (MessageType.PHOTO, "image"),
+    "video": (MessageType.VIDEO, None),
+    "document": (MessageType.DOCUMENT, None),
+    "audio": (MessageType.AUDIO, "audio"),
+    "voice": (MessageType.VOICE, "audio"),
+}
+_MEDIA_KIND_TO_TYPE: dict[str, MessageType] = {
+    "image": MessageType.PHOTO, "video": MessageType.VIDEO,
+    "audio": MessageType.AUDIO, "document": MessageType.DOCUMENT,
+}
+# Honest multipart content type for outbound voice uploads (post-transcode extension wins).
+_VOICE_MIME_BY_EXT: dict[str, str] = {
+    ".ogg": "audio/ogg", ".opus": "audio/opus", ".mp3": "audio/mpeg",
+    ".wav": "audio/wav", ".m4a": "audio/mp4", ".aac": "audio/aac",
+}
+# Bale bots may download files up to 20 MB; keep under the budget with headroom.
+_MAX_INBOUND_FILE_BYTES = 25 * 1024 * 1024
+
+
+def _pick_photo_size(payload: Any) -> Optional[dict]:
+    """Best photo size from a Bale ``photo`` array (largest that fits the budget,
+    else None). Accepts a bare dict for robustness against shape drift."""
+    if isinstance(payload, dict):
+        return payload if (payload.get("file_id") or "").strip() else None
+    candidates = [p for p in payload if isinstance(p, dict) and (p.get("file_id") or "").strip()]
+    if not candidates:
+        return None
+    fits = [p for p in candidates if int(p.get("file_size") or 0) <= _MAX_INBOUND_FILE_BYTES]
+    pool = fits or candidates
+    return max(pool, key=lambda p: (int(p.get("width") or 0) * int(p.get("height") or 0)))
+
+
+async def _download_bale_file_bytes(http: httpx.AsyncClient, url: str) -> bytes:
+    """Size-capped GET of a Bale file URL; raises on non-2xx / unsafe / oversized payloads.
+
+    ``is_safe_url`` resolves the host and blocks private/internal targets (the token in the
+    path is fine — it's a path segment, not userinfo)."""
+    if not is_safe_url(url):
+        raise ValueError("Blocked unsafe file URL (SSRF protection)")
+    async with http.stream("GET", url) as response:
+        response.raise_for_status()
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in response.aiter_bytes():
+            total += len(chunk)
+            if total > _MAX_INBOUND_FILE_BYTES:
+                raise ValueError(f"Inbound file too large (>{_MAX_INBOUND_FILE_BYTES} bytes)")
+            chunks.append(chunk)
+    return b"".join(chunks)
 
 
 class BaleAPIError(Exception):
@@ -243,6 +311,75 @@ class BaleAdapter(BasePlatformAdapter):
         except BaleAPIError as e:
             return SendResult(success=False, error=_describe_error(e))
 
+    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
+                         **kwargs) -> SendResult:
+        """Send an audio file as a native Bale voice message bubble.
+
+        Uses the Bale Bot API ``sendVoice`` endpoint (Telegram-style). Native voice bubbles
+        require Ogg/Opus: non-Opus audio is transcoded with ffmpeg when available (best
+        effort); otherwise the original container is uploaded with its honest content type.
+        Caption is supported (up to 4096 chars, markdown-formatted).
+        """
+        if self._http is None:
+            return SendResult(success=False, error="Not connected")
+        import os as _os
+        if not _os.path.isfile(audio_path):
+            return SendResult(success=False, error=f"Audio file not found: {audio_path}")
+
+        try:
+            # Voice bubbles render broken from MP3/WAV bytes; transcode to Ogg/Opus first.
+            if _os.path.splitext(str(audio_path))[1].lower() not in (".ogg", ".opus"):
+                transcoded = await asyncio.to_thread(transcode_to_ogg_opus, audio_path)
+                if transcoded:
+                    audio_path = transcoded
+                else:
+                    logger.warning(
+                        "Bale: voice transcode unavailable for %s — uploading original container",
+                        _os.path.basename(audio_path))
+            data: dict[str, Any] = {
+                "chat_id": chat_id,
+            }
+            if reply_to:
+                with contextlib.suppress(ValueError):
+                    data["reply_to_message_id"] = int(reply_to)
+            if caption:
+                data["caption"] = _to_bale_markdown(caption)[:_TEXT_LIMIT]
+
+            # Bale sendVoice expects a multipart upload (file field named "voice"); the content
+            # type stays honest to the file's real container.
+            with open(audio_path, "rb") as audio_file:
+                files = {
+                    "voice": (_os.path.basename(audio_path), audio_file,
+                            _VOICE_MIME_BY_EXT.get(_os.path.splitext(str(audio_path))[1].lower(),
+                                                "audio/ogg"))
+                }
+                try:
+                    resp = await self._http.post(
+                        f"{_BASE_URL}/bot{self._token}/sendVoice",
+                        files=files,
+                        data=data)
+                    body = resp.json()
+                except ValueError as e:
+                    return SendResult(success=False, error=f"Non-JSON response ({resp.status_code}) from Bale sendVoice")
+
+                if resp.status_code >= 400 or not body.get("ok"):
+                    err_desc = str(body.get("description", body.get("result", "")))
+                    logger.warning("Bale: sendVoice failed — %s", _describe_error(BaleAPIError(resp.status_code, "send_voice_failed", err_desc)))
+                    return SendResult(success=False, error=err_desc)
+
+                result = body.get("result") or {}
+                msg_id = str(result.get("message_id", "")) or _ms_id()
+                logger.info("Bale: sent voice message %s to chat %s", msg_id, chat_id)
+                return SendResult(success=True, message_id=msg_id)
+        except Exception as e:
+            logger.warning("Bale: send_voice raised — %s", _describe_error(e), exc_info=True)
+            return SendResult(success=False, error=_describe_error(e))
+
+    async def play_tts(self, chat_id: str, audio_path: str, **kwargs) -> SendResult:
+        """Auto-TTS playback: send voice bubble (Bale supports this natively)."""
+        return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
+
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         # getChat returns ChatFullInfo directly as ``result``.
         info = await self._api_call("getChat", {"chat_id": chat_id}) or {}
@@ -274,6 +411,64 @@ class BaleAdapter(BasePlatformAdapter):
             self._http = None
 
     # ── inbound ────────────────────────────────────────────────────────
+
+    async def _fetch_media_for_message(self, message: dict[str, Any]) -> tuple[Optional[CachedMedia], Optional[str]]:
+        """Resolve a Bale media field to cached local media.
+
+        Returns ``(CachedMedia or None, note)`` where *note* is a short user-facing
+        fallback line when a present field could not be processed (missing file_id,
+        oversized, download failure). ``note`` is ``None`` only when no media field was
+        attempted at all.
+        """
+        for field, (_type, default_kind) in _MEDIA_FIELDS.items():
+            payload = message.get(field)
+            if not payload:
+                continue
+            file_id, filename, mime_type, kind_hint = None, "", "", default_kind
+            if field == "photo":
+                size = _pick_photo_size(payload)
+                if not size:
+                    return None, f"[photo received but could not be processed]"
+                file_id = str(size.get("file_id") or "")
+                kind_hint = "image"
+            elif isinstance(payload, dict):
+                file_id = str(payload.get("file_id") or "")
+                filename = str(payload.get("file_name") or "")
+                mime_type = str(payload.get("mime_type") or "")
+            if not file_id:
+                return None, f"[{field} received but could not be processed]"
+            try:
+                meta = await self._api_call("getFile", {"file_id": file_id})
+            except BaleAPIError as e:
+                logger.warning("Bale: getFile failed for %s: %s", field, _describe_error(e))
+                return None, f"[{field} received but could not be processed]"
+            if not isinstance(meta, dict):
+                logger.warning("Bale: unexpected getFile response for %s", field)
+                return None, f"[{field} received but could not be processed]"
+            file_path = str((meta.get("file_path") or "").strip())
+            if not file_path:
+                logger.warning("Bale: getFile returned no file_path for %s", field)
+                return None, f"[{field} received but could not be processed]"
+            # The bot token belongs in the path (API shape); keep any path separators intact.
+            url = f"{_BASE_URL}/file/bot{self._token}/{quote(file_path, safe='/')}"
+            try:
+                data = await _download_bale_file_bytes(self._http, url)
+            except Exception as e:
+                logger.warning("Bale: download failed for %s file: %s", field, _describe_error(e))
+                return None, f"[{field} received but could not be processed]"
+            try:
+                media = await cache_media_bytes_async(
+                    data, filename=filename, mime_type=mime_type, default_kind=kind_hint)
+            except Exception as e:
+                logger.warning("Bale: failed to cache %s file: %s", field, _describe_error(e))
+                return None, f"[{field} received but could not be processed]"
+            if media is None:
+                logger.warning("Bale: cached %s rejected (not a valid image)", field)
+                return None, f"[{field} received but could not be processed]"
+            logger.info("Bale: inbound %s cached (%d bytes) for chat %s",
+                       media.kind, len(data), message.get("chat", {}).get("id"))
+            return media, None
+        return None, None
 
     async def _poll_loop(self) -> None:
         """Long-poll getUpdates; the offset advances past each handled update so it is not redelivered."""
@@ -313,6 +508,22 @@ class BaleAdapter(BasePlatformAdapter):
                 with contextlib.suppress(Exception):
                     await self._notify_fatal_error()
 
+    def _reply_context(self, message: dict) -> tuple[Optional[str], Optional[str]]:
+        """Extract (reply_to_id, reply_to_text) from a Bale message.
+
+        Bale's API mirrors Telegram's — ``reply_to_message`` is an object with
+        ``message_id``, ``text``/``caption``. No partial-quote object exists in
+        Bale's API (unlike PTB's TextQuote), so we return the full replied-to text."""
+        if not message.get("reply_to_message"):
+            return None, None
+        reply = message["reply_to_message"]
+        reply_id = str(reply.get("message_id", ""))
+        text = reply.get("text") or reply.get("caption") or None
+        # Bale API returns rich media as dict objects (voice, photo, video...) — skip those.
+        if isinstance(text, dict):
+            return None, None
+        return reply_id, text
+
     async def _handle_update(self, update: dict) -> None:
         """Dispatch one Bale Update (``message`` / ``callback_query`` / ``pre_checkout_query``)."""
         message = update.get("message")
@@ -328,9 +539,17 @@ class BaleAdapter(BasePlatformAdapter):
             return  # our own message
         chat = message.get("chat") or {}
         text = (message.get("text") or "").strip()
-        if not text:
-            logger.debug("Bale: skipping non-text update from %s", sender.get("id"))
-            return
+        caption = (message.get("caption") or "").strip()
+        media: Optional[CachedMedia] = None
+        media_note: Optional[str] = None
+        # Detect message type from original update fields (voice vs audio distinction matters for auto-TTS).
+        detected_type = MessageType.TEXT
+        for field_name, (_type_hint, _kind) in _MEDIA_FIELDS.items():
+            if message.get(field_name):
+                detected_type = _type_hint
+                break
+        if any(message.get(f) for f in _MEDIA_FIELDS):
+            media, media_note = await self._fetch_media_for_message(message)
         user_id = str(sender.get("id", ""))
         if self._allowed_users and not self._allow_all and user_id not in self._allowed_users:
             logger.debug("Bale: ignoring message from unauthorized user %s", user_id)
@@ -343,8 +562,20 @@ class BaleAdapter(BasePlatformAdapter):
             user_id=user_id,
             user_name=sender.get("username") or sender.get("first_name") or user_id)
         timestamp = datetime.fromtimestamp(int(message.get("date", 0)), tz=UTC)
-        await self.handle_message(MessageEvent(text=text, message_type=MessageType.TEXT, source=source,
-                                               message_id=str(message.get("message_id")), timestamp=timestamp))
+        event_text = text or caption
+        if media is None and not event_text:
+            logger.debug("Bale: skipping non-text update from %s", sender.get("id"))
+            return
+        reply_to_id, reply_to_text = self._reply_context(message)
+        await self.handle_message(MessageEvent(
+            text=event_text or (media_note or "[message received]"),
+            message_type=detected_type,
+            source=source, raw_message=message, message_id=str(message.get("message_id")),
+            timestamp=timestamp,
+            media_urls=[media.path] if media else [],
+            media_types=[media.media_type] if media else [],
+            reply_to_message_id=reply_to_id,
+            reply_to_text=reply_to_text))
 
 
 # ── plugin registration helpers ────────────────────────────────────────

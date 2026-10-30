@@ -9,6 +9,9 @@ from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 # so it cannot collide with other plugin adapters loaded by sibling tests in the same process.
 _bale_mod = load_plugin_adapter("bale")
 
+from gateway.platforms.base import CachedMedia  # noqa: F401 - constructed in media tests
+from gateway.platforms.event import MessageType
+
 _to_bale_markdown = _bale_mod._to_bale_markdown
 _chunk_text = _bale_mod._chunk_text
 BaleAdapter = _bale_mod.BaleAdapter
@@ -152,6 +155,169 @@ class TestBaleInboundUpdates:
         args, kwargs = adapter._http.post.call_args
         assert args[0].endswith("/bot123:abc/answerCallbackQuery")
         assert kwargs["json"] == {"callback_query_id": "cq-1", "text": "✓"}
+
+
+    @pytest.mark.asyncio
+    async def test_photo_message_caches_and_announces(self, adapter, monkeypatch):
+        """A photo update with caption becomes a PHOTO event carrying the cached path."""
+        handle = AsyncMock()
+        adapter.handle_message = handle
+        adapter._bot_id = 999
+        # getFile returns File{file_path}; the download is intercepted by the patched helper.
+        async def fake_api_call(method, payload=None):
+            if method == "getFile":
+                return {"file_path": "photos/1/a.jpg"}
+            raise AssertionError(f"unexpected {method}")
+        adapter._api_call = fake_api_call
+        monkeypatch.setattr(_bale_mod, "_download_bale_file_bytes",
+                            AsyncMock(return_value=b"\xff\xd8\xff\x00fake-jpeg"))
+        monkeypatch.setattr(
+            _bale_mod, "cache_media_bytes_async",
+            AsyncMock(return_value=CachedMedia("/tmp/fake.jpg", "image/jpeg", "image", "a.jpg")))
+        update = {"update_id": 20, "message": {
+            "message_id": 31, "caption": "sunrise", "date": 1_700_000_500,
+            "from": {"id": 55}, "chat": {"id": 1001, "type": "private"},
+            "photo": [
+                {"file_id": "small", "width": 320, "height": 240, "file_size": 50_000},
+                {"file_id": "big", "width": 1600, "height": 1200, "file_size": 900_000},
+            ],
+        }}
+        await adapter._handle_update(update)
+        assert handle.await_count == 1
+        event = handle.await_args.args[0]
+        assert event.message_type is MessageType.PHOTO
+        assert event.text == "sunrise"
+        assert event.media_urls == ["/tmp/fake.jpg"]
+        assert event.media_types == ["image/jpeg"]
+        # The larger, in-budget size wins over the thumbnail.
+        assert adapter._api_call.call_args.args[1] == {"file_id": "big"}
+
+    @pytest.mark.asyncio
+    async def test_voice_update_becomes_voicemessage_event(self, adapter, monkeypatch):
+        """Inbound voice note (voice field) must arrive as MessageType.VOICE so auto-TTS works."""
+        handle = AsyncMock()
+        adapter.handle_message = handle
+        adapter._bot_id = 999
+        async def fake_api_call(method, payload=None):
+            if method == "getFile":
+                return {"file_path": "voice/1/a.ogg"}
+            raise AssertionError(f"unexpected {method}")
+        adapter._api_call = fake_api_call
+        monkeypatch.setattr(_bale_mod, "_download_bale_file_bytes", AsyncMock(return_value=b"fake-ogg-data"))
+        monkeypatch.setattr(
+            _bale_mod, "cache_media_bytes_async",
+            AsyncMock(return_value=CachedMedia("/tmp/fake.ogg", "audio/ogg", "audio", "voice.ogg")))
+        update = {"update_id": 30, "message": {
+            "message_id": 41, "date": 1_700_001_000,
+            "from": {"id": 55}, "chat": {"id": 1001, "type": "private"},
+            "voice": {"file_id": "v-abc", "duration": 7}}}
+        await adapter._handle_update(update)
+        assert handle.await_count == 1
+        event = handle.await_args.args[0]
+        assert event.message_type is MessageType.VOICE, f"Expected VOICE type, got {event.message_type}"
+
+    @pytest.mark.asyncio
+    async def test_audio_file_is_distinct_from_voice_note(self, adapter, monkeypatch):
+        """Audio file uploads (music) are different from user-recorded voice notes."""
+        handle = AsyncMock()
+        adapter.handle_message = handle
+        adapter._bot_id = 999
+        async def fake_api_call(method, payload=None):
+            if method == "getFile":
+                return {"file_path": "audio/1/a.mp3"}
+            raise AssertionError(f"unexpected {method}")
+        adapter._api_call = fake_api_call
+        monkeypatch.setattr(_bale_mod, "_download_bale_file_bytes", AsyncMock(return_value=b"fake-mp3-data"))
+        monkeypatch.setattr(
+            _bale_mod, "cache_media_bytes_async",
+            AsyncMock(return_value=CachedMedia("/tmp/fake.mp3", "audio/mpeg", "audio", "song.mp3")))
+        update_audio = {"update_id": 31, "message": {
+            "message_id": 42, "date": 1_700_001_500,
+            "from": {"id": 55}, "chat": {"id": 1001, "type": "private"},
+            "audio": {"file_id": "a-xyz", "file_name": "song.mp3", "duration": 240}}}
+        await adapter._handle_update(update_audio)
+        assert handle.await_count == 1
+        event = handle.await_args.args[0]
+        assert event.message_type is MessageType.AUDIO, f"Expected AUDIO type for music file, got {event.message_type}"
+
+    @pytest.mark.asyncio
+    async def test_voice_with_caption_passes_text(self, adapter, monkeypatch):
+        """Voice note with caption carries both the audio and text content."""
+        handle = AsyncMock()
+        adapter.handle_message = handle
+        adapter._bot_id = 999
+        async def fake_api_call(method, payload=None):
+            if method == "getFile":
+                return {"file_path": "voice/1/b.ogg"}
+            raise AssertionError(f"unexpected {method}")
+        adapter._api_call = fake_api_call
+        monkeypatch.setattr(_bale_mod, "_download_bale_file_bytes", AsyncMock(return_value=b"fake-ogg-data2"))
+        monkeypatch.setattr(
+            _bale_mod, "cache_media_bytes_async",
+            AsyncMock(return_value=CachedMedia("/tmp/fake.ogg2", "audio/ogg", "audio", "voice.ogg")))
+        update = {"update_id": 32, "message": {
+            "message_id": 43, "caption": "hi there", "date": 1_700_002_000,
+            "from": {"id": 55}, "chat": {"id": 1001, "type": "private"},
+            "voice": {"file_id": "v-def", "duration": 3}}}
+        await adapter._handle_update(update)
+        assert handle.await_count == 1
+        event = handle.await_args.args[0]
+        assert event.message_type is MessageType.VOICE
+        assert event.text == "hi there"
+
+    @pytest.mark.asyncio
+    async def test_photo_download_failure_falls_back_to_note(self, adapter, monkeypatch):
+        handle = AsyncMock()
+        adapter.handle_message = handle
+        adapter._bot_id = 999
+        async def fake_api_call(method, payload=None):
+            if method == "getFile":
+                return {"file_path": "photos/1/b.jpg"}
+            raise AssertionError(f"unexpected {method}")
+        adapter._api_call = fake_api_call
+        async def boom(http, url):  # noqa: ARG001 - unused in the test stub
+            raise RuntimeError("upstream 5xx")
+        monkeypatch.setattr(_bale_mod, "_download_bale_file_bytes", AsyncMock(side_effect=boom))
+        update = {"update_id": 21, "message": {
+            "message_id": 32, "date": 1_700_000_600,
+            "from": {"id": 55}, "chat": {"id": 1001, "type": "private"},
+            "photo": [{"file_id": "big", "width": 800, "height": 600, "file_size": 700_000}],
+        }}
+        await adapter._handle_update(update)
+        assert handle.await_count == 1
+        event = handle.await_args.args[0]
+        assert event.message_type is MessageType.TEXT
+        assert event.text == "[photo received but could not be processed]"
+        assert not event.media_urls
+
+    @pytest.mark.asyncio
+    async def test_document_message_uses_file_name_and_type(self, adapter, monkeypatch):
+        handle = AsyncMock()
+        adapter.handle_message = handle
+        adapter._bot_id = 999
+        async def fake_api_call(method, payload=None):
+            if method == "getFile":
+                return {"file_path": "docs/2/report.pdf"}
+            raise AssertionError(f"unexpected {method}")
+        adapter._api_call = fake_api_call
+        monkeypatch.setattr(_bale_mod, "_download_bale_file_bytes",
+                            AsyncMock(return_value=b"%PDF-1.7 fake"))
+        async def fake_cache(data, **kwargs):
+            return CachedMedia("/tmp/fake.pdf", "application/pdf", "document", "report.pdf")
+        monkeypatch.setattr(_bale_mod, "cache_media_bytes_async", AsyncMock(return_value=fake_cache))
+        update = {"update_id": 22, "message": {
+            "message_id": 33, "caption": "see page 4", "date": 1_700_000_700,
+            "from": {"id": 55}, "chat": {"id": 1001, "type": "private"},
+            "document": {"file_id": "doc-2", "file_name": "report.pdf",
+                        "mime_type": "application/pdf", "file_size": 80_000},
+        }}
+        await adapter._handle_update(update)
+        assert handle.await_count == 1
+        event = handle.await_args.args[0]
+        assert event.message_type is MessageType.DOCUMENT
+        assert event.text == "see page 4"
+        assert event.media_urls == ["/tmp/fake.pdf"]
+        assert event.media_types == ["application/pdf"]
 
 
 class TestBalePollConflict:

@@ -7,7 +7,7 @@ description: >
   Bale (bale.ai) through its Telegram-style Bot API and relays messages between
   Bale chats/groups/channels and the Hermes agent. Long-polls getUpdates, sends
   text and photos with native markdown, typing indicators, user allowlists,
-  and cron delivery. No extra packages needed — plain HTTPS.
+  cron delivery, and voice message support (send/receive audio). No extra packages needed — plain HTTPS.
 author: Nous Research
 # ``requires_env`` entries are surfaced in ``hermes config`` UI via the
 # platform-plugin env var injector in ``hermes_cli/config.py``.

@@ -161,7 +161,7 @@ _EMPTY_OK_COMMANDS: frozenset = frozenset({"close", "record"})  # legitimately e
 # gateway serves every profile from one process, so a single slot would hand the launch
 # profile's browser settings to every other profile.
 _cached_command_timeout: Optional[dict[str, int]] = None
-# Flip the resolved flag BEFORE nulling the cache so a concurrent reader never sees ``resolved=True`` with
+# Flip the resolved flag BEFORE Noneing the cache so a concurrent reader never sees ``resolved=True`` with
 # ``cache=None`` (#14331).
 _command_timeout_resolved = False
 _cached_snapshot_threshold: Optional[dict[str, int]] = None
@@ -616,6 +616,59 @@ BROWSER_TOOL_SCHEMAS = [
             "required": []
         }
     },
+    {
+        "name": "browser_speak",
+        "description": "Speak text aloud using Web Speech Synthesis API. Plays speech through the browser's audio system during an active browser session.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Text to synthesize into speech"
+                },
+                "lang": {
+                    "type": "string",
+                    "default": None,
+                    "description": "BCP-47 language tag (e.g. 'en-US'). Defaults to page locale."
+                },
+                "rate": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 2.0,
+                    "default": None,
+                    "description": "Speech rate multiplier (default 1.0)"
+                },
+                "pitch": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 2.0,
+                    "default": None,
+                    "description": "Speech pitch multiplier (default 1.0)"
+                }
+            },
+            "required": ["text"]
+        }
+    },
+    {
+        "name": "browser_listen",
+        "description": "Listen for speech input via Web Speech Recognition API during an active browser session.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "lang": {
+                    "type": "string",
+                    "default": None,
+                    "description": "BCP-47 language tag (e.g. 'en-US'). Defaults to page locale."
+                }
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "browser_stop_speaking",
+        "description": "Cancel any ongoing speech synthesis.",
+        "parameters": {"type": "object", "properties": {}, "required": []}
+    },
 ]
 
 from tools import browser_tool_snapshot as _snapshot
@@ -1023,6 +1076,31 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     return _dumps(response)
 
 
+
+
+
+def browser_speak(text: str = "", lang: Optional[str] = None, rate: Optional[float] = None,
+                  pitch: Optional[float] = None, task_id: Optional[str] = None) -> str:
+    """Speak text using Web Speech Synthesis API."""
+    from tools.browser_voice_tool import browser_speak as _browser_voice_speak
+    result = _browser_voice_speak(text=text, lang=lang, rate=rate, pitch=pitch)
+    return _dumps(result)
+
+
+def browser_listen(lang: Optional[str] = None, task_id: Optional[str] = None) -> str:
+    """Listen for speech via Web Speech Recognition API."""
+    from tools.browser_voice_tool import browser_listen as _browser_voice_listen
+    result = _browser_voice_listen(lang=lang)
+    return _dumps(result)
+
+
+def browser_stop_speaking(task_id: Optional[str] = None) -> str:
+    """Cancel any ongoing speech synthesis."""
+    from tools.browser_voice_tool import browser_stop_speaking as _browser_voice_stop
+    result = _browser_voice_stop()
+    return _dumps(result)
+
+
 from tools import browser_tool_eval_policy as _eval_policy
 
 
@@ -1348,6 +1426,10 @@ _BROWSER_TOOL_TABLE = (
     ("browser_get_images", "🖼️", _install.check_browser_requirements, {}),
     ("browser_vision", "👁️", _install.check_browser_vision_requirements, {"question": "", "annotate": False}),
     ("browser_console", "🖥️", _install.check_browser_requirements, {"clear": False, "expression": None}),
+    # Browser voice tools
+    ("browser_speak", "🔊", lambda: True, {"text": ""}, ("lang", "rate", "pitch")),
+    ("browser_listen", "🎤", lambda: True, {}, ("lang",)),
+    ("browser_stop_speaking", "🔇", lambda: True, {}),
 )
 
 
